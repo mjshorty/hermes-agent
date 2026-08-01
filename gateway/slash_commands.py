@@ -4558,6 +4558,7 @@ class GatewaySlashCommandsMixin:
             await self._session_db.enable_telegram_topic_mode(
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
+                profile_name=getattr(source, "profile", None),
                 has_topics_enabled=capabilities.get("has_topics_enabled"),
                 allows_users_to_create_topics=capabilities.get("allows_users_to_create_topics"),
             )
@@ -4573,6 +4574,7 @@ class GatewaySlashCommandsMixin:
                 binding = await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
+                    profile_name=getattr(source, "profile", None),
                 )
             except Exception:
                 logger.debug("Failed to read Telegram topic binding", exc_info=True)
