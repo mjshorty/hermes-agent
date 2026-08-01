@@ -7607,6 +7607,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             raw = session_db.is_telegram_topic_mode_enabled(
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
+                profile_name=getattr(source, "profile", None),
             )
         except Exception:
             logger.debug("Failed to read Telegram topic mode state", exc_info=True)
@@ -7708,6 +7709,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_id=str(source.user_id or ""),
             session_key=session_entry.session_key,
             session_id=session_entry.session_id,
+            profile_name=getattr(source, "profile", None),
         )
 
     def _sync_telegram_topic_binding(
@@ -7775,6 +7777,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             bindings = session_db.list_telegram_topic_bindings_for_chat(
                 chat_id=str(source.chat_id),
+                profile_name=getattr(source, "profile", None),
             )
         except Exception:
             logger.debug("topic-recover: read failed", exc_info=True)
@@ -18632,6 +18635,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 binding = (await self._session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
+                    profile_name=getattr(source, "profile", None),
                 )) if self._session_db else None
             except Exception:
                 logger.debug("Failed to read Telegram topic binding", exc_info=True)
@@ -20693,6 +20697,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         users can immediately see if context detection went wrong (e.g.
         local models falling to the 128K default).
         """
+        # Allow per-profile suppression via display.session_info: false
+        try:
+            _data = _load_gateway_config()
+            if isinstance(_data.get("display"), dict) and _data["display"].get("session_info") is False:
+                return ""
+        except Exception:
+            pass
         resolved = _resolve_gateway_model_context()
         model = resolved.model
         provider = resolved.provider
@@ -22703,6 +22714,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 binding = await session_db.get_telegram_topic_binding(
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
+                    profile_name=getattr(source, "profile", None),
                 )
                 if binding and str(binding.get("session_id") or "") != str(session_id):
                     return
@@ -22855,18 +22867,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_id = str(source.chat_id or "")
         if not chat_id:
             return "Could not determine chat ID."
+        profile_name = getattr(source, "profile", None)
         # No-op if never enabled.
         try:
             currently_enabled = await self._session_db.is_telegram_topic_mode_enabled(
                 chat_id=chat_id,
                 user_id=str(source.user_id or ""),
+                profile_name=profile_name,
             )
         except Exception:
             currently_enabled = False
         if not currently_enabled:
             return "Multi-session topic mode is not currently enabled for this chat."
         try:
-            await self._session_db.disable_telegram_topic_mode(chat_id=chat_id)
+            await self._session_db.disable_telegram_topic_mode(
+                chat_id=chat_id,
+                profile_name=profile_name,
+            )
         except Exception as exc:
             logger.exception("Failed to disable Telegram topic mode")
             return f"Failed to disable topic mode: {exc}"
@@ -22897,6 +22914,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             sessions = await self._session_db.list_unlinked_telegram_sessions_for_user(
                 chat_id=str(source.chat_id),
                 user_id=str(source.user_id),
+                profile_name=getattr(source, "profile", None),
                 limit=10,
             )
         except Exception:
@@ -22945,10 +22963,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if str(session.get("user_id") or "") != str(source.user_id):
             return "That session does not belong to this Telegram user."
 
-        linked = await self._session_db.is_telegram_session_linked_to_topic(session_id=session_id)
+        linked = await self._session_db.is_telegram_session_linked_to_topic(
+            session_id=session_id,
+            profile_name=getattr(source, "profile", None),
+        )
         current_binding = await self._session_db.get_telegram_topic_binding(
             chat_id=str(source.chat_id),
             thread_id=str(source.thread_id),
+            profile_name=getattr(source, "profile", None),
         )
         if linked:
             if not current_binding or current_binding.get("session_id") != session_id:
@@ -22962,6 +22984,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 user_id=str(source.user_id),
                 session_key=session_key,
                 session_id=session_id,
+                profile_name=getattr(source, "profile", None),
                 managed_mode="restored",
             )
         except ValueError as exc:

@@ -465,6 +465,35 @@ async def test_topic_binding_follows_compression_tip_on_read(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_topic_root_command_explicitly_migrates_and_enables_topic_mode(tmp_path, monkeypatch):
+    import gateway.run as gateway_run
+
+    session_db = SessionDB(db_path=tmp_path / "state.db")
+    runner = _make_runner(session_db=session_db)
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError("/topic activation must not enter the agent loop")
+    )
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("/topic"))
+
+    assert "Telegram multi-session topics are enabled" in result
+    assert "All Messages" in result
+    assert session_db.get_meta("telegram_dm_topic_schema_version") == "3"
+    assert session_db.is_telegram_topic_mode_enabled(chat_id="208214988", user_id="208214988")
+    assert runner._telegram_topic_mode_enabled(_make_source()) is True
+    runner._run_agent.assert_not_called()
+
+    lobby_result = await runner._handle_message(_make_event("hello after activation"))
+
+    assert "main chat is reserved for system commands" in lobby_result
+    runner._run_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_topic_root_command_lists_unlinked_sessions_for_restore(tmp_path, monkeypatch):
     import gateway.run as gateway_run
 
@@ -618,6 +647,476 @@ async def test_auto_generated_title_renames_bound_telegram_topic(tmp_path):
         thread_id="42",
         name="Build Telegram Topic UX",
     )
+
+
+@pytest.mark.asyncio
+async def test_auto_generated_title_does_not_rename_topic_bound_to_other_session(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.apply_telegram_topic_migration()
+    db.create_session("sess-other", source="telegram", user_id="208214988")
+    db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="42",
+        user_id="208214988",
+        session_key="agent:main:telegram:dm:208214988:42",
+        session_id="sess-other",
+    )
+    runner = _make_runner(session_db=db)
+    runner._telegram_topic_mode_enabled = lambda source: True
+
+    await runner._rename_telegram_topic_for_session_title(
+        _make_source(thread_id="42"),
+        "sess-topic",
+        "Wrong Session Title",
+    )
+
+    runner.adapters[Platform.TELEGRAM].rename_dm_topic.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_operator_declared_topic_is_not_auto_renamed(tmp_path):
+    """Topics registered in extra.dm_topics keep their operator-chosen name."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    db.create_session(session_id="sess-topic", source="telegram", user_id="208214988")
+    db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key=build_session_key(_make_source(thread_id="17585")),
+        session_id="sess-topic",
+    )
+    runner = _make_runner(session_db=db)
+    runner._telegram_topic_mode_enabled = lambda source: True
+
+    # Give the adapter a concrete class with _get_dm_topic_info so the
+    # class-based lookup in _rename_telegram_topic_for_session_title
+    # actually finds it (a MagicMock auto-attr would be skipped).
+    class _FakeAdapter:
+        def _get_dm_topic_info(self, chat_id, thread_id):
+            return {"name": "Research", "skill": "arxiv"}
+
+        async def rename_dm_topic(self, **kwargs):
+            return None
+
+    fake = _FakeAdapter()
+    fake.rename_dm_topic = AsyncMock()
+    runner.adapters[Platform.TELEGRAM] = fake
+
+    await runner._rename_telegram_topic_for_session_title(
+        _make_source(thread_id="17585"),
+        "sess-topic",
+        "Auto-generated title",
+    )
+
+    fake.rename_dm_topic.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_disable_topic_auto_rename_extra_skips_rename(tmp_path):
+    """extra.disable_topic_auto_rename=True must short-circuit auto-rename."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.apply_telegram_topic_migration()
+    db.create_session("sess-topic", source="telegram", user_id="208214988")
+    db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="42",
+        user_id="208214988",
+        session_key="agent:main:telegram:dm:208214988:42",
+        session_id="sess-topic",
+    )
+    runner = _make_runner(session_db=db)
+    runner._telegram_topic_mode_enabled = lambda source: True
+    # Flip the operator switch.
+    runner.config.platforms[Platform.TELEGRAM].extra["disable_topic_auto_rename"] = True
+
+    await runner._rename_telegram_topic_for_session_title(
+        _make_source(thread_id="42"),
+        "sess-topic",
+        "Auto-generated title",
+    )
+
+    runner.adapters[Platform.TELEGRAM].rename_dm_topic.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_schedule_topic_rename_respects_disable_flag(tmp_path):
+    """The scheduling entry-point must also honour disable_topic_auto_rename."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    runner = _make_runner(session_db=db)
+    runner._telegram_topic_mode_enabled = lambda source: True
+    runner.config.platforms[Platform.TELEGRAM].extra["disable_topic_auto_rename"] = "yes"
+
+    # If the flag is honoured we never schedule the coroutine, so
+    # _rename_telegram_topic_for_session_title is never invoked.
+    called = False
+
+    async def _spy(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    runner._rename_telegram_topic_for_session_title = _spy
+
+    runner._schedule_telegram_topic_title_rename(
+        _make_source(thread_id="42"),
+        "sess-topic",
+        "Auto-generated title",
+    )
+
+    # Give any (incorrectly scheduled) coroutine a chance to run.
+    import asyncio
+    await asyncio.sleep(0)
+    assert called is False
+
+
+def test_telegram_topic_auto_rename_disabled_string_truthy(tmp_path):
+    """Common truthy string forms ('1', 'true', 'on', 'yes') must disable rename."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    runner = _make_runner(session_db=db)
+    source = _make_source(thread_id="42")
+
+    cfg_extra = runner.config.platforms[Platform.TELEGRAM].extra
+    for value in ("1", "true", "TRUE", "yes", "on"):
+        cfg_extra["disable_topic_auto_rename"] = value
+        assert runner._telegram_topic_auto_rename_disabled(source) is True, value
+
+    for value in ("0", "false", "no", "off", "", None):
+        cfg_extra["disable_topic_auto_rename"] = value
+        assert runner._telegram_topic_auto_rename_disabled(source) is False, value
+
+    # Explicit bools still work.
+    cfg_extra["disable_topic_auto_rename"] = True
+    assert runner._telegram_topic_auto_rename_disabled(source) is True
+    cfg_extra["disable_topic_auto_rename"] = False
+    assert runner._telegram_topic_auto_rename_disabled(source) is False
+
+
+def test_general_topic_is_treated_as_root_lobby(tmp_path):
+    """Messages in the Telegram General topic (thread_id=1) route to the lobby, not a lane."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    runner = _make_runner(session_db=db)
+
+    general_source = _make_source(thread_id="1")
+    assert runner._is_telegram_topic_root_lobby(general_source) is True
+    assert runner._is_telegram_topic_lane(general_source) is False
+
+    no_thread_source = _make_source(thread_id=None)
+    assert runner._is_telegram_topic_root_lobby(no_thread_source) is True
+    assert runner._is_telegram_topic_lane(no_thread_source) is False
+
+    real_topic = _make_source(thread_id="17585")
+    assert runner._is_telegram_topic_root_lobby(real_topic) is False
+    assert runner._is_telegram_topic_lane(real_topic) is True
+
+
+def test_lobby_reminder_is_debounced_per_chat(tmp_path):
+    """Consecutive root-DM prompts should only surface one lobby reminder per cooldown."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    runner = _make_runner(session_db=db)
+
+    source = _make_source(thread_id=None)
+    assert runner._should_send_telegram_lobby_reminder(source) is True
+    # Next call inside the cooldown window must return False.
+    assert runner._should_send_telegram_lobby_reminder(source) is False
+    assert runner._should_send_telegram_lobby_reminder(source) is False
+
+    # A different chat gets its own window.
+    other = _make_source(thread_id=None)
+    # Swap chat_id so the debounce key is different.
+    from dataclasses import replace
+    other = replace(other, chat_id="999999999")
+    assert runner._should_send_telegram_lobby_reminder(other) is True
+
+
+def test_binding_survives_session_deletion_via_cascade(tmp_path):
+    """Deleting a session with a topic binding must not raise FK errors."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    db.create_session(session_id="sess-to-delete", source="telegram", user_id="208214988")
+    db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key="agent:main:telegram:dm:208214988:17585",
+        session_id="sess-to-delete",
+    )
+
+    # Before: binding exists.
+    binding = db.get_telegram_topic_binding(chat_id="208214988", thread_id="17585")
+    assert binding is not None
+
+    # Delete the session. Without ON DELETE CASCADE this would raise
+    # sqlite3.IntegrityError: FOREIGN KEY constraint failed.
+    db._conn.execute("DELETE FROM sessions WHERE id = ?", ("sess-to-delete",))
+    db._conn.commit()
+
+    # After: binding row automatically cleared.
+    binding_after = db.get_telegram_topic_binding(chat_id="208214988", thread_id="17585")
+    assert binding_after is None
+
+
+def test_migration_rebuilds_v1_binding_table_with_cascade_fk(tmp_path):
+    """v1 → v2 migration rebuilds the bindings table when FK lacks ON DELETE CASCADE."""
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+
+    # Simulate a v1-shaped DB: migration ran without ON DELETE CASCADE.
+    db.apply_telegram_topic_migration()  # Creates v2 (our new shape)
+    # Drop the v2 bindings table and recreate it in the old v1 shape.
+    with db._lock:
+        db._conn.execute("DROP TABLE telegram_dm_topic_bindings")
+        db._conn.execute(
+            """
+            CREATE TABLE telegram_dm_topic_bindings (
+                chat_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                managed_mode TEXT NOT NULL DEFAULT 'auto',
+                linked_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (chat_id, thread_id)
+            )
+            """
+        )
+        # Also rewind the version marker so migration treats this as v1.
+        db._conn.execute(
+            "UPDATE state_meta SET value = '1' WHERE key = 'telegram_dm_topic_schema_version'"
+        )
+        db._conn.commit()
+
+    # Sanity check: FK has no CASCADE action yet.
+    fk_rows = db._conn.execute(
+        "PRAGMA foreign_key_list('telegram_dm_topic_bindings')"
+    ).fetchall()
+    assert any(row[2] == "sessions" and (row[6] or "") != "CASCADE" for row in fk_rows)
+
+    # Re-run migration — should upgrade to v2 shape, then to v3 (multiplex
+    # isolation, #76423) in the same pass.
+    db.apply_telegram_topic_migration()
+
+    fk_rows_after = db._conn.execute(
+        "PRAGMA foreign_key_list('telegram_dm_topic_bindings')"
+    ).fetchall()
+    assert any(row[2] == "sessions" and row[6] == "CASCADE" for row in fk_rows_after)
+
+    version = db._conn.execute(
+        "SELECT value FROM state_meta WHERE key = 'telegram_dm_topic_schema_version'"
+    ).fetchone()
+    assert version is not None and version[0] == "3"
+
+
+def test_migration_v2_to_v3_adds_profile_name_and_compound_pk(tmp_path):
+    """v2 → v3 migration isolates rows by multiplex profile (#76423)."""
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.apply_telegram_topic_migration()  # lands on v3
+
+    # Reset to a v2-shape DB by dropping the profile_name column and
+    # reverting to the v2 PK shape, then rewind the version marker.
+    with db._lock:
+        db._conn.executescript(
+            """
+            CREATE TABLE telegram_dm_topic_mode_v2 (
+                chat_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                activated_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                has_topics_enabled INTEGER,
+                allows_users_to_create_topics INTEGER,
+                capability_checked_at REAL,
+                intro_message_id TEXT,
+                pinned_message_id TEXT
+            );
+            INSERT INTO telegram_dm_topic_mode_v2
+                SELECT chat_id, user_id, enabled, activated_at, updated_at,
+                       has_topics_enabled, allows_users_to_create_topics,
+                       capability_checked_at, intro_message_id, pinned_message_id
+                FROM telegram_dm_topic_mode;
+            DROP TABLE telegram_dm_topic_mode;
+            ALTER TABLE telegram_dm_topic_mode_v2 RENAME TO telegram_dm_topic_mode;
+            """
+        )
+        db._conn.executescript(
+            """
+            CREATE TABLE telegram_dm_topic_bindings_v2 (
+                chat_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                session_key TEXT NOT NULL,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                managed_mode TEXT NOT NULL DEFAULT 'auto',
+                linked_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                PRIMARY KEY (chat_id, thread_id)
+            );
+            INSERT INTO telegram_dm_topic_bindings_v2
+                SELECT chat_id, thread_id, user_id, session_key, session_id,
+                       managed_mode, linked_at, updated_at
+                FROM telegram_dm_topic_bindings;
+            DROP TABLE telegram_dm_topic_bindings;
+            ALTER TABLE telegram_dm_topic_bindings_v2
+                RENAME TO telegram_dm_topic_bindings;
+            CREATE UNIQUE INDEX idx_telegram_dm_topic_bindings_session
+                ON telegram_dm_topic_bindings(session_id);
+            CREATE INDEX idx_telegram_dm_topic_bindings_user
+                ON telegram_dm_topic_bindings(user_id, chat_id);
+            """
+        )
+        db._conn.execute(
+            "UPDATE state_meta SET value = '2' WHERE key = 'telegram_dm_topic_schema_version'"
+        )
+        db._conn.commit()
+
+    # Seed a legacy row that has no profile_name yet. The sessions row must
+    # be inserted first so the bindings FK resolves.
+    with db._lock:
+        db._conn.execute(
+            "INSERT OR IGNORE INTO sessions (id, source, user_id, started_at) "
+            "VALUES (?, ?, ?, ?)",
+            ("sess-legacy", "telegram", "legacy-user", 1.0),
+        )
+        db._conn.execute(
+            "INSERT INTO telegram_dm_topic_mode "
+            "(chat_id, user_id, enabled, activated_at, updated_at) "
+            "VALUES (?, ?, 1, ?, ?)",
+            ("legacy-chat", "legacy-user", 1.0, 2.0),
+        )
+        db._conn.execute(
+            "INSERT INTO telegram_dm_topic_bindings "
+            "(chat_id, thread_id, user_id, session_key, session_id, linked_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("legacy-chat", "legacy-thread", "legacy-user",
+             "k", "sess-legacy", 1.0, 2.0),
+        )
+        db._conn.commit()
+
+    db.apply_telegram_topic_migration()
+
+    version = db._conn.execute(
+        "SELECT value FROM state_meta WHERE key = 'telegram_dm_topic_schema_version'"
+    ).fetchone()
+    assert version is not None and version[0] == "3"
+
+    # Legacy row was stamped under __default__ so single-profile installs
+    # continue to address the same chat_ids (#76423).
+    rows = db._conn.execute(
+        "SELECT profile_name, chat_id FROM telegram_dm_topic_mode"
+    ).fetchall()
+    assert ("__default__", "legacy-chat") in {(r[0], r[1]) for r in rows}
+
+    bind_rows = db._conn.execute(
+        "SELECT profile_name, chat_id, thread_id FROM telegram_dm_topic_bindings"
+    ).fetchall()
+    assert ("__default__", "legacy-chat", "legacy-thread") in {
+        (r[0], r[1], r[2]) for r in bind_rows
+    }
+
+    # Fresh writes from a multiplexed profile land under that profile and
+    # do not collide with the legacy default-profile row.
+    db.enable_telegram_topic_mode(
+        chat_id="legacy-chat", user_id="legacy-user", profile_name="profileA",
+    )
+    db.create_session(session_id="sess-A", source="telegram", user_id="legacy-user")
+    db.bind_telegram_topic(
+        chat_id="legacy-chat", thread_id="topicA",
+        user_id="legacy-user", session_key="kA", session_id="sess-A",
+        profile_name="profileA",
+    )
+    db.create_session(session_id="sess-B", source="telegram", user_id="legacy-user")
+    db.bind_telegram_topic(
+        chat_id="legacy-chat", thread_id="topicB",
+        user_id="legacy-user", session_key="kB", session_id="sess-B",
+        profile_name="profileB",
+    )
+
+    # Each profile owns its own (chat_id, thread_id) binding without
+    # overwriting the others — the bug at issue #76423.
+    assert db.get_telegram_topic_binding(
+        chat_id="legacy-chat", thread_id="topicA", profile_name="profileA",
+    )["session_id"] == "sess-A"
+    assert db.get_telegram_topic_binding(
+        chat_id="legacy-chat", thread_id="topicB", profile_name="profileB",
+    )["session_id"] == "sess-B"
+    assert db.get_telegram_topic_binding(
+        chat_id="legacy-chat", thread_id="topicA", profile_name="profileB",
+    ) is None
+    # Legacy __default__ row remains intact.
+    assert db.is_telegram_topic_mode_enabled(
+        chat_id="legacy-chat", user_id="legacy-user", profile_name="__default__",
+    ) is True
+    assert db.is_telegram_topic_mode_enabled(
+        chat_id="legacy-chat", user_id="legacy-user", profile_name="profileA",
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_topic_help_subcommand_returns_usage(tmp_path):
+    """/topic help surfaces usage without activating anything."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    runner = _make_runner(session_db=db)
+
+    result = await runner._handle_topic_command(_make_event("/topic help"))
+
+    assert "/topic help" in result
+    assert "/topic off" in result
+    assert "/topic <id>" in result
+    # No side effects — topic mode tables should not even exist yet.
+    tables = {
+        row[0]
+        for row in db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'telegram_dm%'"
+        ).fetchall()
+    }
+    assert tables == set()
+
+
+@pytest.mark.asyncio
+async def test_topic_off_disables_mode_and_clears_bindings(tmp_path, monkeypatch):
+    """/topic off flips the row off AND deletes bindings for this chat."""
+    import gateway.run as gateway_run
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    db.create_session(session_id="topic-sess", source="telegram", user_id="208214988")
+    db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="17585",
+        user_id="208214988",
+        session_key="k",
+        session_id="topic-sess",
+    )
+    runner = _make_runner(session_db=db)
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_topic_command(_make_event("/topic off"))
+
+    assert "OFF" in result or "off" in result
+    assert db.is_telegram_topic_mode_enabled(
+        chat_id="208214988", user_id="208214988"
+    ) is False
+    # Bindings cleared.
+    assert db.get_telegram_topic_binding(
+        chat_id="208214988", thread_id="17585"
+    ) is None
+
+
+@pytest.mark.asyncio
+async def test_topic_off_is_idempotent_when_never_enabled(tmp_path):
+    """/topic off against a chat that never ran /topic is a no-op message."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    runner = _make_runner(session_db=db)
+
+    result = await runner._handle_topic_command(_make_event("/topic off"))
+
+    assert "not currently enabled" in result
 
 
 @pytest.mark.asyncio
